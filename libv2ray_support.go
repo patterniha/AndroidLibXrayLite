@@ -39,20 +39,13 @@ func (r *resolved) NextIP() {
 	defer r.ipLock.Unlock()
 
 	if len(r.IPs) > 1 {
-		now := time.Now()
-		if now.Sub(r.lastSwitched) < 5*time.Second {
-			log.Println("switch too quickly")
-			return
-		}
+		now := time.Now()		
 		r.lastSwitched = now
 		r.ipIdx++
+		if r.ipIdx >= uint8(len(r.IPs)) {
+			r.ipIdx = 0
+		}
 	}
-
-	if r.ipIdx >= uint8(len(r.IPs)) {
-		r.ipIdx = 0
-	}
-
-	log.Printf("switched to next IP: %v", r.IPs[r.ipIdx])
 }
 
 // currentIP returns the current IP address
