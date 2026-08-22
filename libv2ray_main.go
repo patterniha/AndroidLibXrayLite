@@ -137,7 +137,7 @@ func (x *CoreController) StopLoop() error {
 
 // CheckVersionX returns the library and Xray versions
 func CheckVersionX() string {
-	return fmt.Sprintf("Lib v%d, Xray-core v%s", libVersion, core.Version())
+	return fmt.Sprintf("Lib v%d, patterniha/Xray-core v%s", libVersion, core.Version())
 }
 
 // ReconcileBrowserDialer updates the browser dialer address and reloads its configuration
