@@ -4,8 +4,8 @@ go 1.27
 
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
-	github.com/xtls/xray-core v1.260327.1-0.20260728075948-5ca6f4b7d4dc
-	golang.org/x/mobile v0.0.0-20260709172247-6129f5bee9d5
+	github.com/xtls/xray-core v1.260327.1-0.20260908222543-52a412d9e2f5
+	golang.org/x/mobile v0.0.0-20260908204917-8b95e45f8d3e
 )
 
 require (
@@ -44,12 +44,12 @@ require (
 	github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842 // indirect
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb // indirect
@@ -61,5 +61,3 @@ require (
 	gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
-
-replace github.com/xtls/xray-core => github.com/patterniha/xray-core v0.0.0-20260909182812-400821cd7bfb
