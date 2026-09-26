@@ -12,7 +12,7 @@ import (
 	"time"
 
 	corenet "github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/session"
 	core "github.com/xtls/xray-core/core"
 	corestats "github.com/xtls/xray-core/features/stats"
 	coreserial "github.com/xtls/xray-core/infra/conf/serial"
@@ -59,41 +59,39 @@ func (x *CoreController) MeasureDelay(url string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
-	return measureInstDelay(ctx, x.coreInstance, url)
+	return measureInstDelay(ctx, x.coreInstance, "", url)
 }
 
-// MeasureOutboundDelay measures the outbound delay for a given configuration and URL
+// MeasureOutboundDelay measures the outbound delay for a given configuration and URL, through the first
+// outbound of the configuration. All measurements run in one shared instance (see libv2ray_delay.go).
 func MeasureOutboundDelay(ConfigureFileContent string, url string) (int64, error) {
-	config, err := coreserial.LoadJSONConfig(strings.NewReader(ConfigureFileContent))
+	prefix := delayDefaultTag + "-" + strconv.FormatUint(delayMeasurements.Add(1), 10)
+	content, tag, err := prefixOutboundTags(ConfigureFileContent, prefix)
+	if err != nil {
+		return -1, fmt.Errorf("config load error: %w", err)
+	}
+	config, err := coreserial.LoadJSONConfig(strings.NewReader(content))
 	if err != nil {
 		return -1, fmt.Errorf("config load error: %w", err)
 	}
 
-	config.Inbound = nil
-	var essentialApp []*serial.TypedMessage
-	for _, app := range config.App {
-		if app.Type == "xray.app.proxyman.OutboundConfig" ||
-			app.Type == "xray.app.dispatcher.Config" ||
-			app.Type == "xray.app.log.Config" {
-			essentialApp = append(essentialApp, app)
-		}
-	}
-	config.App = essentialApp
-
-	inst, err := core.New(config)
+	inst, err := acquireDelayInstance(config)
 	if err != nil {
 		return -1, fmt.Errorf("instance creation failed: %w", err)
 	}
+	defer releaseDelayInstance()
 
-	if err := inst.Start(); err != nil {
-		return -1, fmt.Errorf("startup failed: %w", err)
+	remove, err := addDelayOutbounds(inst, config.Outbound)
+	defer remove()
+	if err != nil {
+		return -1, fmt.Errorf("outbound creation failed: %w", err)
 	}
-	defer inst.Close()
-	return measureInstDelay(context.Background(), inst, url)
+	return measureInstDelay(context.Background(), inst, tag, url)
 }
 
-// measureInstDelay measures the delay for an instance to a given URL
-func measureInstDelay(ctx context.Context, inst *core.Instance, url string) (int64, error) {
+// measureInstDelay measures the delay for an instance to a given URL, through the outbound with
+// outboundTag, or as the instance routes it when outboundTag is empty
+func measureInstDelay(ctx context.Context, inst *core.Instance, outboundTag string, url string) (int64, error) {
 	if inst == nil {
 		return -1, errors.New("core instance is nil")
 	}
@@ -109,6 +107,10 @@ func measureInstDelay(ctx context.Context, inst *core.Instance, url string) (int
 			dest, err := corenet.ParseDestination(fmt.Sprintf("%s:%s", network, addr))
 			if err != nil {
 				return nil, err
+			}
+			if outboundTag != "" {
+				// A session content for each dial: the dispatcher clears the tag in the one it reads.
+				ctx = session.SetForcedOutboundTagToContext(session.ContextWithContent(ctx, &session.Content{}), outboundTag)
 			}
 			return core.Dial(ctx, inst, dest)
 		},

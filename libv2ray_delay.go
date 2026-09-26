@@ -1,0 +1,187 @@
+package libv2ray
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/xtls/xray-core/common/serial"
+	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/outbound"
+	json_reader "github.com/xtls/xray-core/infra/conf/json"
+	"github.com/xtls/xray-core/proxy/blackhole"
+)
+
+// Xray runs at most one instance per process (core/xray.go: "At any time, there must be at most one
+// Server instance running"): the instance created last sets the outbound manager and the DNS client
+// that every dialerProxy and domainStrategy of the process resolves with. MeasureOutboundDelay
+// therefore measures every configuration in one shared instance, which runs while any measurement
+// does. A measurement adds the outbounds of its configuration under tags of its own, dials through the
+// first of them and removes them again, so measurements that run at the same time never use each
+// other's outbounds.
+
+// delayDefaultTag is the tag of the shared instance's own outbound, a blackhole that is its default
+// handler, so that no measured outbound becomes the default. Measured tags start with it and a number.
+const delayDefaultTag = "delay-test"
+
+var delayInstance struct {
+	sync.Mutex
+	instance *core.Instance
+	users    int
+}
+
+// delayMeasurements numbers the measurements for the tags of their outbounds.
+var delayMeasurements atomic.Uint64
+
+// acquireDelayInstance returns the shared instance. When no measurement runs, it starts one with the
+// apps of config that a measurement needs. Each successful call must be followed by
+// releaseDelayInstance.
+func acquireDelayInstance(config *core.Config) (*core.Instance, error) {
+	delayInstance.Lock()
+	defer delayInstance.Unlock()
+
+	if delayInstance.instance == nil {
+		var apps []*serial.TypedMessage
+		for _, app := range config.App {
+			if app.Type == "xray.app.proxyman.OutboundConfig" ||
+				app.Type == "xray.app.dispatcher.Config" ||
+				app.Type == "xray.app.log.Config" {
+				apps = append(apps, app)
+			}
+		}
+		inst, err := core.New(&core.Config{
+			App: apps,
+			Outbound: []*core.OutboundHandlerConfig{{
+				Tag:           delayDefaultTag,
+				ProxySettings: serial.ToTypedMessage(&blackhole.Config{}),
+			}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := inst.Start(); err != nil {
+			inst.Close()
+			return nil, err
+		}
+		delayInstance.instance = inst
+	}
+	delayInstance.users++
+	return delayInstance.instance, nil
+}
+
+// releaseDelayInstance closes the shared instance once no measurement uses it.
+func releaseDelayInstance() {
+	delayInstance.Lock()
+	defer delayInstance.Unlock()
+
+	delayInstance.users--
+	if delayInstance.users == 0 {
+		delayInstance.instance.Close()
+		delayInstance.instance = nil
+	}
+}
+
+// addDelayOutbounds adds the outbounds of a measurement to the shared instance. The returned function
+// removes and closes those it added, also after an error.
+func addDelayOutbounds(inst *core.Instance, configs []*core.OutboundHandlerConfig) (func(), error) {
+	outbounds := inst.GetFeature(outbound.ManagerType()).(outbound.Manager)
+	remove := func() {
+		for _, config := range configs {
+			if handler := outbounds.GetHandler(config.Tag); handler != nil {
+				outbounds.RemoveHandler(context.Background(), config.Tag)
+				handler.Close()
+			}
+		}
+	}
+	for _, config := range configs {
+		if err := core.AddOutboundHandler(inst, config); err != nil {
+			return remove, err
+		}
+	}
+	return remove, nil
+}
+
+// prefixOutboundTags gives every outbound of the configuration content a tag of the measurement:
+// prefix followed by "/" and its own tag, or by "#" and its index when it has none. Every dialerProxy
+// that names an outbound of the configuration follows it to its new tag. It returns the new content and
+// the tag of the first outbound, which the measurement dials through.
+func prefixOutboundTags(content string, prefix string) (string, string, error) {
+	decoder := json.NewDecoder(&json_reader.Reader{Reader: strings.NewReader(content)})
+	decoder.UseNumber()
+	var config map[string]any
+	if err := decoder.Decode(&config); err != nil {
+		return "", "", err
+	}
+	outbounds, _ := config[jsonKey(config, "outbounds")].([]any)
+	if len(outbounds) == 0 {
+		return "", "", errors.New("the configuration has no outbound")
+	}
+
+	tags := make(map[string]string, len(outbounds))
+	var firstTag string
+	for i, element := range outbounds {
+		outbound, ok := element.(map[string]any)
+		if !ok {
+			return "", "", fmt.Errorf("outbound %d is not an object", i)
+		}
+		key := jsonKey(outbound, "tag")
+		newTag := prefix + "#" + strconv.Itoa(i)
+		if tag, _ := outbound[key].(string); tag != "" {
+			newTag = prefix + "/" + tag
+			tags[tag] = newTag
+		}
+		outbound[key] = newTag
+		if i == 0 {
+			firstTag = newTag
+		}
+	}
+	for _, element := range outbounds {
+		relinkDialerProxies(element, tags)
+	}
+
+	newContent, err := json.Marshal(config)
+	if err != nil {
+		return "", "", err
+	}
+	return string(newContent), firstTag, nil
+}
+
+// relinkDialerProxies points every dialerProxy in value that names an outbound of the configuration at
+// that outbound's new tag. Any other dialerProxy names no outbound of the measurement either way.
+func relinkDialerProxies(value any, tags map[string]string) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, element := range value {
+			if tag, ok := element.(string); ok && strings.EqualFold(key, "dialerProxy") {
+				if newTag, ok := tags[tag]; ok {
+					value[key] = newTag
+				}
+				continue
+			}
+			relinkDialerProxies(element, tags)
+		}
+	case []any:
+		for _, element := range value {
+			relinkDialerProxies(element, tags)
+		}
+	}
+}
+
+// jsonKey returns the key of object that Xray reads as name: Go matches JSON keys to fields without
+// regard to case, preferring an exact match. It returns name when object has no such key.
+func jsonKey(object map[string]any, name string) string {
+	if _, ok := object[name]; ok {
+		return name
+	}
+	for key := range object {
+		if strings.EqualFold(key, name) {
+			return key
+		}
+	}
+	return name
+}
