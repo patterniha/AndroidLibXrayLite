@@ -9,7 +9,9 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestPrefixOutboundTags(t *testing.T) {
@@ -201,6 +203,159 @@ func TestMeasureOutboundDelayCleansUpAfterAnError(t *testing.T) {
 	if delayInstanceRunning() {
 		t.Error("the shared instance still runs after the failed measurement")
 	}
+}
+
+func TestCancelOutboundDelaysEndsItsBatchAtOnce(t *testing.T) {
+	// A SOCKS server that never answers keeps each measurement waiting for its 12-second timeout.
+	server := startStallingServer(t)
+	config := stallingConfig(server)
+	a, b := newBatchName("cancel-a"), newBatchName("cancel-b")
+	type result struct {
+		batch string
+		delay int64
+		err   error
+	}
+	results := make(chan result, 6)
+	for _, batch := range []string{a, a, a, a, b, b} {
+		go func() {
+			delay, err := MeasureOutboundDelayInBatch(batch, config, "http://delay.test/generate_204")
+			results <- result{batch, delay, err}
+		}()
+	}
+	server.awaitConnections(t, 6)
+
+	CancelOutboundDelays(a)
+	for range 4 {
+		select {
+		case r := <-results:
+			if r.batch != a || r.delay != -1 || r.err != nil {
+				t.Errorf("after batch %s was cancelled, a measurement returned %+v", a, r)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("a measurement of the cancelled batch still runs")
+		}
+	}
+	select {
+	case r := <-results:
+		t.Fatalf("a measurement of the other batch returned %+v", r)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	CancelOutboundDelays(b)
+	for range 2 {
+		select {
+		case r := <-results:
+			if r.delay != -1 || r.err != nil {
+				t.Errorf("after batch %s was cancelled, a measurement returned %+v", b, r)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("a measurement of the second batch still runs after it was cancelled")
+		}
+	}
+	if delayInstanceRunning() {
+		t.Error("the shared instance still runs after its measurements were cancelled")
+	}
+}
+
+func TestMeasureOutboundDelayInACancelledBatchReturnsAtOnce(t *testing.T) {
+	// The caller may have passed its last check when its test stopped
+	server := startStallingServer(t)
+	batch := newBatchName("cancel-c")
+	CancelOutboundDelays(batch)
+
+	start := time.Now()
+	delay, err := MeasureOutboundDelayInBatch(batch, stallingConfig(server), "http://delay.test/generate_204")
+	if delay != -1 || err != nil {
+		t.Errorf("a measurement of a cancelled batch returned %d, %v", delay, err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("a measurement of a cancelled batch took %v", elapsed)
+	}
+	if n := server.accepted.Load(); n != 0 {
+		t.Errorf("a measurement of a cancelled batch connected %d times", n)
+	}
+	if delayInstanceRunning() {
+		t.Error("a measurement of a cancelled batch started the shared instance")
+	}
+}
+
+func TestMeasureOutboundDelayInBatchForgetsAFinishedBatch(t *testing.T) {
+	batch := newBatchName("finished")
+	_, err := MeasureOutboundDelayInBatch(batch, `{
+		"log": {"loglevel": "none"},
+		"outbounds": [{"protocol": "blackhole"}]
+	}`, "http://delay.test/generate_204")
+	if err == nil {
+		t.Error("a measurement through a blackhole succeeded")
+	}
+	delayBatches.Lock()
+	_, kept := delayBatches.batches[batch]
+	delayBatches.Unlock()
+	if kept {
+		t.Error("a batch is kept after its measurements finished")
+	}
+}
+
+// batchNames numbers the batches of the tests. A cancelled batch stays cancelled, so each test names its
+// batches anew, as PattNG does for each of its tests.
+var batchNames atomic.Uint64
+
+func newBatchName(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, batchNames.Add(1))
+}
+
+// stallingServer accepts connections and never answers, like a proxy server whose far end is gone.
+type stallingServer struct {
+	port     int
+	accepted atomic.Int32
+}
+
+func startStallingServer(t *testing.T) *stallingServer {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &stallingServer{port: listener.Addr().(*net.TCPAddr).Port}
+	var conns sync.Map
+	t.Cleanup(func() {
+		listener.Close()
+		conns.Range(func(conn, _ any) bool {
+			conn.(net.Conn).Close()
+			return true
+		})
+	})
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			conns.Store(conn, nil)
+			server.accepted.Add(1)
+		}
+	}()
+	return server
+}
+
+// awaitConnections waits until n measurements connected to the server.
+func (s *stallingServer) awaitConnections(t *testing.T, n int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.accepted.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d measurements connected", s.accepted.Load(), n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// stallingConfig is a configuration whose outbound is a SOCKS proxy at server.
+func stallingConfig(server *stallingServer) string {
+	return fmt.Sprintf(`{
+		"log": {"loglevel": "none"},
+		"outbounds": [{"protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": %d}]}}]
+	}`, server.port)
 }
 
 // dnsQueries records the names that a DNS server of a test was asked for.

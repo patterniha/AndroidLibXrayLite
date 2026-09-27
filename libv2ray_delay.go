@@ -38,6 +38,70 @@ var delayInstance struct {
 // delayMeasurements numbers the measurements for the tags of their outbounds.
 var delayMeasurements atomic.Uint64
 
+// delayBatches holds the batches of measurements that run or were cancelled. PattNG measures the configurations
+// of a test as one batch, and ends it with CancelOutboundDelays when the test stops: it cannot interrupt a
+// measurement, which blocks a Java thread in Go.
+var delayBatches = struct {
+	sync.Mutex
+	batches map[string]*delayBatch
+}{batches: map[string]*delayBatch{}}
+
+type delayBatch struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	users  int
+	// cancelled is set by CancelOutboundDelays. The batch is then kept for the life of the process, so that a
+	// measurement that starts later returns at once as well: its caller may have passed its last check already.
+	// PattNG names the batch of each test anew and cancels it at most once.
+	cancelled bool
+}
+
+// delayBatchOf returns the batch with name, which it adds when there is none. The caller holds delayBatches.
+func delayBatchOf(name string) *delayBatch {
+	batch := delayBatches.batches[name]
+	if batch == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		batch = &delayBatch{ctx: ctx, cancel: cancel}
+		delayBatches.batches[name] = batch
+	}
+	return batch
+}
+
+// acquireDelayBatch returns the context of the measurements of the batch with name. Each call must be followed
+// by releaseDelayBatch.
+func acquireDelayBatch(name string) context.Context {
+	delayBatches.Lock()
+	defer delayBatches.Unlock()
+
+	batch := delayBatchOf(name)
+	batch.users++
+	return batch.ctx
+}
+
+// releaseDelayBatch forgets the batch with name once none of its measurements runs, unless it was cancelled.
+func releaseDelayBatch(name string) {
+	delayBatches.Lock()
+	defer delayBatches.Unlock()
+
+	batch := delayBatches.batches[name]
+	batch.users--
+	if batch.users == 0 && !batch.cancelled {
+		batch.cancel()
+		delete(delayBatches.batches, name)
+	}
+}
+
+// CancelOutboundDelays ends the measurements of the batch with name at once: the running ones return -1, and so
+// do those that start later. The measurements of other batches go on.
+func CancelOutboundDelays(name string) {
+	delayBatches.Lock()
+	defer delayBatches.Unlock()
+
+	batch := delayBatchOf(name)
+	batch.cancelled = true
+	batch.cancel()
+}
+
 // acquireDelayInstance returns the shared instance. When no measurement runs, it starts one with the
 // apps of config that a measurement needs. Each successful call must be followed by
 // releaseDelayInstance.

@@ -65,6 +65,27 @@ func (x *CoreController) MeasureDelay(url string) (int64, error) {
 // MeasureOutboundDelay measures the outbound delay for a given configuration and URL, through the first
 // outbound of the configuration. All measurements run in one shared instance (see libv2ray_delay.go).
 func MeasureOutboundDelay(ConfigureFileContent string, url string) (int64, error) {
+	return measureOutboundDelay(context.Background(), ConfigureFileContent, url)
+}
+
+// MeasureOutboundDelayInBatch is MeasureOutboundDelay for a measurement of the batch with name batch, which
+// CancelOutboundDelays ends at once. A measurement that its batch ends returns -1 without an error.
+func MeasureOutboundDelayInBatch(batch string, ConfigureFileContent string, url string) (int64, error) {
+	ctx := acquireDelayBatch(batch)
+	defer releaseDelayBatch(batch)
+
+	delay, err := measureOutboundDelay(ctx, ConfigureFileContent, url)
+	if ctx.Err() != nil {
+		return -1, nil
+	}
+	return delay, err
+}
+
+// measureOutboundDelay is MeasureOutboundDelay, which ends when ctx does.
+func measureOutboundDelay(ctx context.Context, ConfigureFileContent string, url string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
 	prefix := delayDefaultTag + "-" + strconv.FormatUint(delayMeasurements.Add(1), 10)
 	content, tag, err := prefixOutboundTags(ConfigureFileContent, prefix)
 	if err != nil {
@@ -86,7 +107,7 @@ func MeasureOutboundDelay(ConfigureFileContent string, url string) (int64, error
 	if err != nil {
 		return -1, fmt.Errorf("outbound creation failed: %w", err)
 	}
-	return measureInstDelay(context.Background(), inst, tag, url)
+	return measureInstDelay(ctx, inst, tag, url)
 }
 
 // measureInstDelay measures the delay for an instance to a given URL, through the outbound with
