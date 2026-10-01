@@ -176,7 +176,9 @@ func (x *CoreController) doStartLoop(configContent string) error {
 	log.Println("starting core...")
 	x.IsRunning = true
 	if err := x.coreInstance.Start(); err != nil {
-		x.IsRunning = false
+		// What started before the failure would otherwise run on beside the next instance, and Xray runs at
+		// most one instance per process (core/xray.go); StopLoop cannot reach it once IsRunning is false.
+		x.doShutdown()
 		return fmt.Errorf("startup failed: %w", err)
 	}
 
