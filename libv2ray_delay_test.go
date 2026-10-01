@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -293,6 +294,100 @@ func TestMeasureOutboundDelayInBatchForgetsAFinishedBatch(t *testing.T) {
 	delayBatches.Unlock()
 	if kept {
 		t.Error("a batch is kept after its measurements finished")
+	}
+}
+
+func TestOpenExitSendsWhatComesInStraightOut(t *testing.T) {
+	// A server stands for the internet, and an HTTP client with the exit as its SOCKS proxy for a core
+	// that dials out through it.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	port, err := OpenExit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second core of the process shares the exit, and the first one letting go does not close it.
+	again, err := OpenExit()
+	if err != nil || again != port {
+		t.Fatalf("a second core got the exit %d (%v) beside %d", again, err, port)
+	}
+	CloseExit()
+
+	proxy := &url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)}
+	transport := &http.Transport{Proxy: http.ProxyURL(proxy)}
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal("the exit carried nothing: ", err)
+	}
+	resp.Body.Close()
+	transport.CloseIdleConnections()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Error("the exit answered ", resp.Status)
+	}
+
+	CloseExit()
+	if conn, err := net.DialTimeout("tcp", proxy.Host, time.Second); err == nil {
+		conn.Close()
+		t.Error("the exit still listens after the last core let go of it")
+	}
+	if delayInstanceRunning() {
+		t.Error("the shared instance still runs after the exit closed")
+	}
+	// Letting go once more lets go of nothing.
+	CloseExit()
+}
+
+func TestOpenExitLeavesTheMeasurementsTheirDialer(t *testing.T) {
+	// A measurement keeps the shared instance running while the exit opens. An exit of an instance of its
+	// own would set the dialer of the process, where the dialerProxy of a later measurement would then
+	// not be found; the exit is part of the shared instance instead.
+	stalling := startStallingServer(t)
+	batch := newBatchName("exit")
+	stalled := make(chan struct{})
+	go func() {
+		MeasureOutboundDelayInBatch(batch, stallingConfig(stalling), "http://delay.test/generate_204")
+		close(stalled)
+	}()
+	stalling.awaitConnections(t, 1)
+
+	if _, err := OpenExit(); err != nil {
+		t.Fatal(err)
+	}
+	delayInstance.Lock()
+	shared := delayExit.inst == delayInstance.instance
+	delayInstance.Unlock()
+	if !shared {
+		t.Error("the exit runs in an instance of its own")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	chain := fmt.Sprintf(`{
+		"log": {"loglevel": "none"},
+		"outbounds": [
+			{"tag": "proxy", "protocol": "freedom", "streamSettings": {"sockopt": {"dialerProxy": "hop"}}},
+			{"tag": "hop", "protocol": "freedom", "settings": {"redirect": %q}}
+		]
+	}`, server.Listener.Addr().String())
+	if _, err := MeasureOutboundDelay(chain, "http://delay.test/generate_204"); err != nil {
+		t.Error("a measurement through a dialerProxy failed beside the exit: ", err)
+	}
+
+	CloseExit()
+	CancelOutboundDelays(batch)
+	select {
+	case <-stalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stalled measurement still runs after its batch was cancelled")
+	}
+	if delayInstanceRunning() {
+		t.Error("the shared instance still runs after the exit and the measurements")
 	}
 }
 

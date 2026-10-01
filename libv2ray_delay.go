@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,8 +13,10 @@ import (
 
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/outbound"
 	json_reader "github.com/xtls/xray-core/infra/conf/json"
+	coreserial "github.com/xtls/xray-core/infra/conf/serial"
 	"github.com/xtls/xray-core/proxy/blackhole"
 )
 
@@ -23,7 +26,7 @@ import (
 // therefore measures every configuration in one shared instance, which runs while any measurement
 // does. A measurement adds the outbounds of its configuration under tags of its own, dials through the
 // first of them and removes them again, so measurements that run at the same time never use each
-// other's outbounds.
+// other's outbounds. The exit that OpenExit opens is part of the same instance, for the same reason.
 
 // delayDefaultTag is the tag of the shared instance's own outbound, a blackhole that is its default
 // handler, so that no measured outbound becomes the default. Measured tags start with it and a number.
@@ -102,9 +105,9 @@ func CancelOutboundDelays(name string) {
 	batch.cancel()
 }
 
-// acquireDelayInstance returns the shared instance. When no measurement runs, it starts one with the
-// apps of config that a measurement needs. Each successful call must be followed by
-// releaseDelayInstance.
+// acquireDelayInstance returns the shared instance. When neither a measurement nor the exit uses it, it
+// starts one with the apps of config that they need, and the routing of the exit. Each successful call
+// must be followed by releaseDelayInstance.
 func acquireDelayInstance(config *core.Config) (*core.Instance, error) {
 	delayInstance.Lock()
 	defer delayInstance.Unlock()
@@ -113,11 +116,17 @@ func acquireDelayInstance(config *core.Config) (*core.Instance, error) {
 		var apps []*serial.TypedMessage
 		for _, app := range config.App {
 			if app.Type == "xray.app.proxyman.OutboundConfig" ||
+				app.Type == "xray.app.proxyman.InboundConfig" ||
 				app.Type == "xray.app.dispatcher.Config" ||
 				app.Type == "xray.app.log.Config" {
 				apps = append(apps, app)
 			}
 		}
+		routing, err := exitRouting()
+		if err != nil {
+			return nil, err
+		}
+		apps = append(apps, routing)
 		inst, err := core.New(&core.Config{
 			App: apps,
 			Outbound: []*core.OutboundHandlerConfig{{
@@ -138,7 +147,7 @@ func acquireDelayInstance(config *core.Config) (*core.Instance, error) {
 	return delayInstance.instance, nil
 }
 
-// releaseDelayInstance closes the shared instance once no measurement uses it.
+// releaseDelayInstance closes the shared instance once neither a measurement nor the exit uses it.
 func releaseDelayInstance() {
 	delayInstance.Lock()
 	defer delayInstance.Unlock()
@@ -168,6 +177,107 @@ func addDelayOutbounds(inst *core.Instance, configs []*core.OutboundHandlerConfi
 		}
 	}
 	return remove, nil
+}
+
+// The cores that PattNG runs on their own, for scans, key renewals and latency tests, dial out through
+// the exit of the shared instance of their process, as the core of a session dials out through an
+// inbound of the session's configuration: what comes in on the mixed inbound exitInboundTag, on the
+// loopback address, leaves by the freedom outbound exitOutboundTag. The cores of a process share it.
+const (
+	exitInboundTag  = "secondary-socks"
+	exitOutboundTag = "exit-node"
+)
+
+var delayExit struct {
+	sync.Mutex
+	inst   *core.Instance
+	port   int
+	users  int
+	remove func()
+}
+
+// OpenExit returns the port of the exit, which it opens when it is not open; the shared instance runs
+// while the exit is open. Each successful call must be followed by CloseExit.
+func OpenExit() (int64, error) {
+	delayExit.Lock()
+	defer delayExit.Unlock()
+
+	if delayExit.users > 0 {
+		delayExit.users++
+		return int64(delayExit.port), nil
+	}
+	port, err := freeLoopbackPort()
+	if err != nil {
+		return -1, fmt.Errorf("no port for the exit: %w", err)
+	}
+	config, err := coreserial.LoadJSONConfig(strings.NewReader(fmt.Sprintf(`{
+		"inbounds": [{"tag": %q, "port": %d, "listen": "127.0.0.1", "protocol": "mixed", "settings": {"udp": true}}],
+		"outbounds": [{"tag": %q, "protocol": "freedom"}]
+	}`, exitInboundTag, port, exitOutboundTag)))
+	if err != nil {
+		return -1, fmt.Errorf("config load error: %w", err)
+	}
+	inst, err := acquireDelayInstance(config)
+	if err != nil {
+		return -1, fmt.Errorf("instance creation failed: %w", err)
+	}
+	remove, err := addDelayOutbounds(inst, config.Outbound)
+	if err == nil {
+		err = core.AddInboundHandler(inst, config.Inbound[0])
+	}
+	if err != nil {
+		remove()
+		releaseDelayInstance()
+		return -1, fmt.Errorf("exit creation failed: %w", err)
+	}
+	delayExit.inst, delayExit.port, delayExit.users, delayExit.remove = inst, port, 1, remove
+	return int64(port), nil
+}
+
+// CloseExit lets go of the exit that OpenExit returned. The last one closes it, and the shared instance
+// with it unless a measurement runs.
+func CloseExit() {
+	delayExit.Lock()
+	defer delayExit.Unlock()
+
+	if delayExit.users == 0 {
+		return
+	}
+	delayExit.users--
+	if delayExit.users > 0 {
+		return
+	}
+	inbounds := delayExit.inst.GetFeature(inbound.ManagerType()).(inbound.Manager)
+	inbounds.RemoveHandler(context.Background(), exitInboundTag)
+	delayExit.remove()
+	delayExit.inst, delayExit.remove = nil, nil
+	releaseDelayInstance()
+}
+
+// exitRouting returns the routing app of the shared instance: what comes in on the exit leaves by its
+// outbound. A measurement names its outbound, which routing then has no say in.
+func exitRouting() (*serial.TypedMessage, error) {
+	config, err := coreserial.LoadJSONConfig(strings.NewReader(fmt.Sprintf(
+		`{"routing": {"rules": [{"inboundTag": [%q], "outboundTag": %q}]}}`, exitInboundTag, exitOutboundTag)))
+	if err != nil {
+		return nil, err
+	}
+	for _, app := range config.App {
+		if app.Type == "xray.app.router.Config" {
+			return app, nil
+		}
+	}
+	return nil, errors.New("the routing of the exit has no router")
+}
+
+// freeLoopbackPort returns a port of the loopback address that nothing listens on.
+func freeLoopbackPort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
 // prefixOutboundTags gives every outbound of the configuration content a tag of the measurement:
