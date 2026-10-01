@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
 	json_reader "github.com/xtls/xray-core/infra/conf/json"
@@ -243,10 +244,14 @@ func OpenExit(config string) (int64, error) {
 	return int64(delayExit.port), nil
 }
 
+// exitPort picks the port of the exit's inbound; a test points it at a port that is taken.
+var exitPort = freeLoopbackPort
+
 // addExitInbound adds the inbound of the exit, on a free port of the loopback address, and the rule that
-// sends what comes in on it out by the exit-node to inst. The caller holds delayExit.
+// sends what comes in on it out by the exit-node to inst. The caller holds delayExit. On an error it leaves
+// neither behind, so the next exit tries again.
 func addExitInbound(inst *core.Instance) error {
-	port, err := freeLoopbackPort()
+	port, err := exitPort()
 	if err != nil {
 		return err
 	}
@@ -266,6 +271,10 @@ func addExitInbound(inst *core.Instance) error {
 		return err
 	}
 	if err := core.AddInboundHandler(inst, config.Inbound[0]); err != nil {
+		// Xray keeps an inbound that did not start, such as one whose port was taken meanwhile, under
+		// its tag; left there, it would refuse the inbound of every later exit of the instance.
+		inbounds := inst.GetFeature(inbound.ManagerType()).(inbound.Manager)
+		inbounds.RemoveHandler(context.Background(), exitInboundTag)
 		routes.RemoveRule(exitRuleTag)
 		return err
 	}
@@ -288,13 +297,13 @@ func CloseExit() {
 	releaseDelayInstance()
 }
 
-// exitOutbounds returns, as the JSON of a configuration with outbounds alone, the outbound of the
-// configuration content tagged exitOutboundTag and every outbound of content that it dials through by
+// exitOutbounds returns, as the JSON of a configuration with outbounds and its log alone, the outbound of
+// the configuration content tagged exitOutboundTag and every outbound of content that it dials through by
 // dialerProxy, at any depth. Those come along under tags of the exit, exitOutboundTag followed by "/" and
 // their own tag, so that they never meet the outbounds of a measurement, and every dialerProxy among
 // them follows its outbound to the new tag. A dialerProxy that names no outbound of content is left as
 // it is: it names no outbound of the exit either way. When several outbounds have a tag, the first
-// counts, as it does for Xray.
+// counts, as it does for Xray. The log of content is kept for a shared instance the exit starts.
 func exitOutbounds(content string) (string, error) {
 	decoder := json.NewDecoder(&json_reader.Reader{Reader: strings.NewReader(content)})
 	decoder.UseNumber()
@@ -336,7 +345,11 @@ func exitOutbounds(content string) (string, error) {
 		outbounds = append(outbounds, outbound)
 	}
 
-	exit, err := json.Marshal(map[string]any{"outbounds": outbounds})
+	kept := map[string]any{"outbounds": outbounds}
+	if log, found := config[jsonKey(config, "log")]; found {
+		kept["log"] = log
+	}
+	exit, err := json.Marshal(kept)
 	if err != nil {
 		return "", err
 	}

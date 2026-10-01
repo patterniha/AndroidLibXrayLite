@@ -301,6 +301,7 @@ func TestMeasureOutboundDelayInBatchForgetsAFinishedBatch(t *testing.T) {
 }
 
 func TestOpenExitSwapsTheExitNodeBehindOneInbound(t *testing.T) {
+	t.Cleanup(CloseExit)
 	// Two servers stand for where two exit-nodes lead, and an HTTP client with the exit as its SOCKS proxy
 	// for a core that dials out through it. A measurement keeps the shared instance running, as the
 	// other profiles of a test do: the second core finds the inbound of the first, and only the exit-node
@@ -330,6 +331,7 @@ func TestOpenExitSwapsTheExitNodeBehindOneInbound(t *testing.T) {
 
 	stalling := startStallingServer(t)
 	batch := newBatchName("swap")
+	t.Cleanup(func() { CancelOutboundDelays(batch) })
 	stalled := make(chan struct{})
 	go func() {
 		MeasureOutboundDelayInBatch(batch, stallingConfig(stalling), "http://delay.test/generate_204")
@@ -391,6 +393,7 @@ func TestOpenExitSwapsTheExitNodeBehindOneInbound(t *testing.T) {
 const plainExit = `{"outbounds": [{"tag": "exit-node", "protocol": "freedom"}]}`
 
 func TestOpenExitServesOneCoreAtATime(t *testing.T) {
+	t.Cleanup(CloseExit)
 	if _, err := OpenExit(plainExit); err != nil {
 		t.Fatal(err)
 	}
@@ -409,26 +412,97 @@ func TestOpenExitServesOneCoreAtATime(t *testing.T) {
 
 func TestOpenExitDialsByTheSockoptOfItsOutbound(t *testing.T) {
 	// The exit-node of a profile carries the profile's dialMode in its sockopt, and the exit dials by it:
-	// a mode this Xray does not know refuses every dial.
+	// a mode this Xray does not know refuses every dial, while the same exit-node without one gets through.
+	t.Cleanup(CloseExit)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	port, err := OpenExit(fmt.Sprintf(`{"outbounds": [{
-		"tag": "exit-node",
-		"protocol": "freedom",
-		"settings": {"redirect": %q},
-		"streamSettings": {"sockopt": {"dialMode": "no-such-dial-mode"}}
-	}]}`, server.Listener.Addr().String()))
+	exitNode := func(sockopt string) string {
+		return fmt.Sprintf(`{"outbounds": [{"tag": "exit-node", "protocol": "freedom", "settings": {"redirect": %q}%s}]}`,
+			server.Listener.Addr().String(), sockopt)
+	}
+	get := func(port int64) error {
+		transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
+		defer transport.CloseIdleConnections()
+		resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/")
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		return nil
+	}
+
+	port, err := OpenExit(exitNode(""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer CloseExit()
+	if err := get(port); err != nil {
+		t.Fatal("the exit-node without a dialMode did not get through: ", err)
+	}
+	CloseExit()
+
+	port, err = OpenExit(exitNode(`, "streamSettings": {"sockopt": {"dialMode": "no-such-dial-mode"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if get(port) == nil {
+		t.Error("the exit dialled by a dialMode this Xray does not know")
+	}
+}
+
+func TestAnExitWhoseInboundCannotListenLeavesNothingBehind(t *testing.T) {
+	// A port taken between its pick and the bind: that exit does not open, and the next exit of the same
+	// shared instance, which a measurement keeps running, gets an inbound of its own and works.
+	t.Cleanup(CloseExit)
+	t.Cleanup(func() { exitPort = freeLoopbackPort })
+	stalling := startStallingServer(t)
+	batch := newBatchName("taken")
+	t.Cleanup(func() { CancelOutboundDelays(batch) })
+	stalled := make(chan struct{})
+	go func() {
+		MeasureOutboundDelayInBatch(batch, stallingConfig(stalling), "http://delay.test/generate_204")
+		close(stalled)
+	}()
+	stalling.awaitConnections(t, 1)
+
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	exitPort = func() (int, error) { return taken.Addr().(*net.TCPAddr).Port, nil }
+	if _, err := OpenExit(plainExit); err == nil {
+		t.Fatal("an exit opened on a port something else listens on")
+	}
+	exitPort = freeLoopbackPort
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	port, err := OpenExit(fmt.Sprintf(`{"outbounds": [{"tag": "exit-node", "protocol": "freedom", "settings": {"redirect": %q}}]}`,
+		server.Listener.Addr().String()))
+	if err != nil {
+		t.Fatal("the next exit of the instance did not open: ", err)
+	}
 	transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
 	defer transport.CloseIdleConnections()
-	if resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/"); err == nil {
-		resp.Body.Close()
-		t.Error("the exit dialled by a dialMode this Xray does not know")
+	resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/")
+	if err != nil {
+		t.Fatal("no answer through the next exit: ", err)
+	}
+	resp.Body.Close()
+
+	CloseExit()
+	CancelOutboundDelays(batch)
+	select {
+	case <-stalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stalled measurement still runs after its batch was cancelled")
+	}
+	if delayInstanceRunning() {
+		t.Error("the shared instance still runs after the exit and the measurement")
 	}
 }
 
@@ -450,11 +524,13 @@ func TestOpenExitRefusesAConfigurationWithoutAUsableExitNode(t *testing.T) {
 }
 
 func TestOpenExitLeavesTheMeasurementsTheirDialer(t *testing.T) {
+	t.Cleanup(CloseExit)
 	// A measurement keeps the shared instance running while the exit opens. An exit of an instance of its
 	// own would set the dialer of the process, where the dialerProxy of a later measurement would then
 	// not be found; the exit is part of the shared instance instead.
 	stalling := startStallingServer(t)
 	batch := newBatchName("exit")
+	t.Cleanup(func() { CancelOutboundDelays(batch) })
 	stalled := make(chan struct{})
 	go func() {
 		MeasureOutboundDelayInBatch(batch, stallingConfig(stalling), "http://delay.test/generate_204")
@@ -507,6 +583,7 @@ func TestExitOutboundsBringAlongWhatTheExitNodeDialsThrough(t *testing.T) {
 	// exit-node dials through hop, which dials through the exit-node's own ECH outbound in turn. The
 	// outbound to the core and an outbound nothing of the exit-node dials through stay out.
 	content := `{
+		"log": {"loglevel": "none"},
 		"inbounds": [{"tag": "socks", "port": 10808, "protocol": "socks"}],
 		"outbounds": [
 			{"tag": "proxy", "protocol": "socks", "settings": {"address": "127.0.0.1", "port": 10819}},
@@ -525,8 +602,16 @@ func TestExitOutboundsBringAlongWhatTheExitNodeDialsThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	decoded := decodeJSON(t, exit).(map[string]any)
+	// The log of the configuration counts for a shared instance the exit starts; its inbounds do not come along.
+	if got := decoded["log"]; !reflect.DeepEqual(got, map[string]any{"loglevel": "none"}) {
+		t.Errorf("the exit keeps the log %v", got)
+	}
+	if _, found := decoded["inbounds"]; found {
+		t.Error("the exit brings along the inbounds of the configuration")
+	}
 	outbounds := map[string]map[string]any{}
-	for _, element := range decodeJSON(t, exit).(map[string]any)["outbounds"].([]any) {
+	for _, element := range decoded["outbounds"].([]any) {
 		outbound := element.(map[string]any)
 		outbounds[outbound["tag"].(string)] = outbound
 	}
@@ -560,6 +645,7 @@ func TestExitOutboundsBringAlongWhatTheExitNodeDialsThrough(t *testing.T) {
 }
 
 func TestOpenExitDialsThroughTheHopsOfItsExitNode(t *testing.T) {
+	t.Cleanup(CloseExit)
 	// A proxy chain's hop as the exit-node, which dials through the hop after it: the request leaves by
 	// the last hop, which leads to the server.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -568,6 +654,7 @@ func TestOpenExitDialsThroughTheHopsOfItsExitNode(t *testing.T) {
 	defer server.Close()
 	stalling := startStallingServer(t)
 	batch := newBatchName("hops")
+	t.Cleanup(func() { CancelOutboundDelays(batch) })
 	stalled := make(chan struct{})
 	go func() {
 		MeasureOutboundDelayInBatch(batch, stallingConfig(stalling), "http://delay.test/generate_204")
