@@ -3,6 +3,7 @@ package libv2ray
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/xtls/xray-core/features/outbound"
 )
 
 func TestPrefixOutboundTags(t *testing.T) {
@@ -297,48 +300,153 @@ func TestMeasureOutboundDelayInBatchForgetsAFinishedBatch(t *testing.T) {
 	}
 }
 
-func TestOpenExitSendsWhatComesInStraightOut(t *testing.T) {
-	// A server stands for the internet, and an HTTP client with the exit as its SOCKS proxy for a core
-	// that dials out through it.
+func TestOpenExitSwapsTheExitNodeBehindOneInbound(t *testing.T) {
+	// Two servers stand for where two exit-nodes lead, and an HTTP client with the exit as its SOCKS proxy
+	// for a core that dials out through it. A measurement keeps the shared instance running, as the
+	// other profiles of a test do: the second core finds the inbound of the first, and only the exit-node
+	// has changed.
+	serverOf := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(name))
+		}))
+	}
+	a, b := serverOf("a"), serverOf("b")
+	defer a.Close()
+	defer b.Close()
+	exitNode := func(server *httptest.Server) string {
+		return fmt.Sprintf(`{"outbounds": [{"tag": "exit-node", "protocol": "freedom", "settings": {"redirect": %q}}]}`, server.Listener.Addr().String())
+	}
+	through := func(port int64) (string, error) {
+		transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
+		defer transport.CloseIdleConnections()
+		resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/")
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		return string(body), err
+	}
+
+	stalling := startStallingServer(t)
+	batch := newBatchName("swap")
+	stalled := make(chan struct{})
+	go func() {
+		MeasureOutboundDelayInBatch(batch, stallingConfig(stalling), "http://delay.test/generate_204")
+		close(stalled)
+	}()
+	stalling.awaitConnections(t, 1)
+
+	portA, err := OpenExit(exitNode(a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := through(portA); err != nil || got != "a" {
+		t.Errorf("the first exit-node reached %q (%v)", got, err)
+	}
+	CloseExit()
+
+	portB, err := OpenExit(exitNode(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if portB != portA {
+		t.Errorf("the second core got the inbound on %d, the first on %d", portB, portA)
+	}
+	if got, err := through(portB); err != nil || got != "b" {
+		t.Errorf("the second exit-node reached %q (%v)", got, err)
+	}
+	CloseExit()
+
+	CancelOutboundDelays(batch)
+	select {
+	case <-stalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stalled measurement still runs after its batch was cancelled")
+	}
+	if delayInstanceRunning() {
+		t.Error("the shared instance still runs after the exits and the measurement")
+	}
+	// The inbound went with the instance, and the next instance gets one of its own.
+	if conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", portA), time.Second); err == nil {
+		conn.Close()
+		t.Error("the inbound of the exit still listens after the shared instance closed")
+	}
+	portC, err := OpenExit(exitNode(a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := through(portC); err != nil || got != "a" {
+		t.Errorf("the exit of a new instance reached %q (%v)", got, err)
+	}
+	CloseExit()
+	// Letting go once more lets go of nothing.
+	CloseExit()
+	if delayInstanceRunning() {
+		t.Error("the shared instance still runs after the last exit closed")
+	}
+}
+
+// plainExit is the configuration of a plain exit-node, as a profile without finalMask and dialMode has it.
+const plainExit = `{"outbounds": [{"tag": "exit-node", "protocol": "freedom"}]}`
+
+func TestOpenExitServesOneCoreAtATime(t *testing.T) {
+	if _, err := OpenExit(plainExit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExit(plainExit); err == nil {
+		t.Error("a second core got the exit before the first let go of it")
+	}
+	CloseExit()
+	if _, err := OpenExit(plainExit); err != nil {
+		t.Error("the exit stayed taken after the first core let go of it: ", err)
+	}
+	CloseExit()
+	if delayInstanceRunning() {
+		t.Error("the shared instance still runs after the exit closed")
+	}
+}
+
+func TestOpenExitDialsByTheSockoptOfItsOutbound(t *testing.T) {
+	// The exit-node of a profile carries the profile's dialMode in its sockopt, and the exit dials by it:
+	// a mode this Xray does not know refuses every dial.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-
-	port, err := OpenExit()
+	port, err := OpenExit(fmt.Sprintf(`{"outbounds": [{
+		"tag": "exit-node",
+		"protocol": "freedom",
+		"settings": {"redirect": %q},
+		"streamSettings": {"sockopt": {"dialMode": "no-such-dial-mode"}}
+	}]}`, server.Listener.Addr().String()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A second core of the process shares the exit, and the first one letting go does not close it.
-	again, err := OpenExit()
-	if err != nil || again != port {
-		t.Fatalf("a second core got the exit %d (%v) beside %d", again, err, port)
+	defer CloseExit()
+	transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
+	defer transport.CloseIdleConnections()
+	if resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/"); err == nil {
+		resp.Body.Close()
+		t.Error("the exit dialled by a dialMode this Xray does not know")
 	}
-	CloseExit()
+}
 
-	proxy := &url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)}
-	transport := &http.Transport{Proxy: http.ProxyURL(proxy)}
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
-	resp, err := client.Get(server.URL)
-	if err != nil {
-		t.Fatal("the exit carried nothing: ", err)
-	}
-	resp.Body.Close()
-	transport.CloseIdleConnections()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Error("the exit answered ", resp.Status)
-	}
-
-	CloseExit()
-	if conn, err := net.DialTimeout("tcp", proxy.Host, time.Second); err == nil {
-		conn.Close()
-		t.Error("the exit still listens after the last core let go of it")
+func TestOpenExitRefusesAConfigurationWithoutAUsableExitNode(t *testing.T) {
+	for _, config := range []string{
+		"not json", "[]", "null", "{}",
+		`{"outbounds": [{"protocol": "freedom"}]}`,
+		`{"outbounds": [{"tag": "proxy", "protocol": "freedom"}]}`,
+		`{"outbounds": [{"tag": "exit-node", "protocol": "no-such-protocol"}]}`,
+	} {
+		if _, err := OpenExit(config); err == nil {
+			CloseExit()
+			t.Errorf("an exit opened with the configuration %s", config)
+		}
 	}
 	if delayInstanceRunning() {
-		t.Error("the shared instance still runs after the exit closed")
+		t.Error("the shared instance runs after the refused exits")
 	}
-	// Letting go once more lets go of nothing.
-	CloseExit()
 }
 
 func TestOpenExitLeavesTheMeasurementsTheirDialer(t *testing.T) {
@@ -354,11 +462,14 @@ func TestOpenExitLeavesTheMeasurementsTheirDialer(t *testing.T) {
 	}()
 	stalling.awaitConnections(t, 1)
 
-	if _, err := OpenExit(); err != nil {
+	if _, err := OpenExit(plainExit); err != nil {
 		t.Fatal(err)
 	}
+	delayExit.Lock()
+	exitInstance := delayExit.inst
+	delayExit.Unlock()
 	delayInstance.Lock()
-	shared := delayExit.inst == delayInstance.instance
+	shared := exitInstance != nil && exitInstance == delayInstance.instance
 	delayInstance.Unlock()
 	if !shared {
 		t.Error("the exit runs in an instance of its own")
@@ -388,6 +499,122 @@ func TestOpenExitLeavesTheMeasurementsTheirDialer(t *testing.T) {
 	}
 	if delayInstanceRunning() {
 		t.Error("the shared instance still runs after the exit and the measurements")
+	}
+}
+
+func TestExitOutboundsBringAlongWhatTheExitNodeDialsThrough(t *testing.T) {
+	// The configuration of a chain whose Aether hop dials out through the two hops after it: the
+	// exit-node dials through hop, which dials through the exit-node's own ECH outbound in turn. The
+	// outbound to the core and an outbound nothing of the exit-node dials through stay out.
+	content := `{
+		"inbounds": [{"tag": "socks", "port": 10808, "protocol": "socks"}],
+		"outbounds": [
+			{"tag": "proxy", "protocol": "socks", "settings": {"address": "127.0.0.1", "port": 10819}},
+			{"tag": "exit-node", "protocol": "vless", "streamSettings": {
+				"sockopt": {"dialerProxy": "hop"},
+				"tlsSettings": {"echSockopt": {"dialerProxy": "ech"}}
+			}},
+			{"tag": "hop", "protocol": "trojan", "streamSettings": {"sockopt": {"dialerProxy": "exit-node"}}},
+			{"tag": "ech", "protocol": "freedom", "streamSettings": {"sockopt": {"dialerProxy": "elsewhere"}}},
+			{"tag": "other", "protocol": "freedom", "streamSettings": {"sockopt": {"dialerProxy": "hop"}}},
+			{"tag": "hop", "protocol": "shadowsocks"}
+		]
+	}`
+
+	exit, err := exitOutbounds(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbounds := map[string]map[string]any{}
+	for _, element := range decodeJSON(t, exit).(map[string]any)["outbounds"].([]any) {
+		outbound := element.(map[string]any)
+		outbounds[outbound["tag"].(string)] = outbound
+	}
+	if len(outbounds) != 3 || outbounds["exit-node"] == nil || outbounds["exit-node/hop"] == nil || outbounds["exit-node/ech"] == nil {
+		t.Fatalf("the exit brings along %v", exit)
+	}
+	dialerProxyOf := func(outbound map[string]any, path ...string) any {
+		var value any = outbound
+		for _, key := range path {
+			value = value.(map[string]any)[key]
+		}
+		return value
+	}
+	if got := dialerProxyOf(outbounds["exit-node"], "streamSettings", "sockopt", "dialerProxy"); got != "exit-node/hop" {
+		t.Errorf("the exit-node dials through %v", got)
+	}
+	if got := dialerProxyOf(outbounds["exit-node"], "streamSettings", "tlsSettings", "echSockopt", "dialerProxy"); got != "exit-node/ech" {
+		t.Errorf("the exit-node queries ECH through %v", got)
+	}
+	// The first outbound with a tag is the one, and a loop back to the exit-node ends there.
+	if got := outbounds["exit-node/hop"]["protocol"]; got != "trojan" {
+		t.Errorf("the hop brought along is the %v outbound", got)
+	}
+	if got := dialerProxyOf(outbounds["exit-node/hop"], "streamSettings", "sockopt", "dialerProxy"); got != "exit-node" {
+		t.Errorf("the hop dials through %v", got)
+	}
+	// A dialerProxy that names nothing of the configuration is left as written.
+	if got := dialerProxyOf(outbounds["exit-node/ech"], "streamSettings", "sockopt", "dialerProxy"); got != "elsewhere" {
+		t.Errorf("the ECH outbound dials through %v", got)
+	}
+}
+
+func TestOpenExitDialsThroughTheHopsOfItsExitNode(t *testing.T) {
+	// A proxy chain's hop as the exit-node, which dials through the hop after it: the request leaves by
+	// the last hop, which leads to the server.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hop"))
+	}))
+	defer server.Close()
+	stalling := startStallingServer(t)
+	batch := newBatchName("hops")
+	stalled := make(chan struct{})
+	go func() {
+		MeasureOutboundDelayInBatch(batch, stallingConfig(stalling), "http://delay.test/generate_204")
+		close(stalled)
+	}()
+	stalling.awaitConnections(t, 1)
+
+	port, err := OpenExit(fmt.Sprintf(`{"outbounds": [
+		{"tag": "proxy", "protocol": "socks", "settings": {"address": "127.0.0.1", "port": 9}},
+		{"tag": "exit-node", "protocol": "freedom", "streamSettings": {"sockopt": {"dialerProxy": "hop"}}},
+		{"tag": "hop", "protocol": "freedom", "settings": {"redirect": %q}}
+	]}`, server.Listener.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers := func() outbound.Manager {
+		delayInstance.Lock()
+		defer delayInstance.Unlock()
+		return delayInstance.instance.GetFeature(outbound.ManagerType()).(outbound.Manager)
+	}
+	if handlers().GetHandler("exit-node/hop") == nil || handlers().GetHandler("exit-node/proxy") != nil {
+		t.Error("the exit holds other outbounds than its exit-node and the hop it dials through")
+	}
+	transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
+	defer transport.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/")
+	if err != nil {
+		t.Fatal("no answer through the hops of the exit-node: ", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || string(body) != "hop" {
+		t.Errorf("the exit reached %q (%v)", body, err)
+	}
+
+	CloseExit()
+	if handlers().GetHandler("exit-node") != nil || handlers().GetHandler("exit-node/hop") != nil {
+		t.Error("the exit-node or its hop is left after the exit closed")
+	}
+	CancelOutboundDelays(batch)
+	select {
+	case <-stalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stalled measurement still runs after its batch was cancelled")
+	}
+	if delayInstanceRunning() {
+		t.Error("the shared instance still runs after the exit and the measurement")
 	}
 }
 

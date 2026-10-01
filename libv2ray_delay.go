@@ -11,10 +11,11 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
-	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/outbound"
+	"github.com/xtls/xray-core/features/routing"
 	json_reader "github.com/xtls/xray-core/infra/conf/json"
 	coreserial "github.com/xtls/xray-core/infra/conf/serial"
 	"github.com/xtls/xray-core/proxy/blackhole"
@@ -26,7 +27,7 @@ import (
 // therefore measures every configuration in one shared instance, which runs while any measurement
 // does. A measurement adds the outbounds of its configuration under tags of its own, dials through the
 // first of them and removes them again, so measurements that run at the same time never use each
-// other's outbounds. The exit that OpenExit opens is part of the same instance, for the same reason.
+// other's outbounds. The exits that OpenExit opens are part of the same instance, for the same reason.
 
 // delayDefaultTag is the tag of the shared instance's own outbound, a blackhole that is its default
 // handler, so that no measured outbound becomes the default. Measured tags start with it and a number.
@@ -105,9 +106,9 @@ func CancelOutboundDelays(name string) {
 	batch.cancel()
 }
 
-// acquireDelayInstance returns the shared instance. When neither a measurement nor the exit uses it, it
-// starts one with the apps of config that they need, and the routing of the exit. Each successful call
-// must be followed by releaseDelayInstance.
+// acquireDelayInstance returns the shared instance. When neither a measurement nor an exit uses it, it
+// starts one with the apps of config that they need, and a router for the rules of the exits. Each
+// successful call must be followed by releaseDelayInstance.
 func acquireDelayInstance(config *core.Config) (*core.Instance, error) {
 	delayInstance.Lock()
 	defer delayInstance.Unlock()
@@ -122,11 +123,7 @@ func acquireDelayInstance(config *core.Config) (*core.Instance, error) {
 				apps = append(apps, app)
 			}
 		}
-		routing, err := exitRouting()
-		if err != nil {
-			return nil, err
-		}
-		apps = append(apps, routing)
+		apps = append(apps, serial.ToTypedMessage(&router.Config{}))
 		inst, err := core.New(&core.Config{
 			App: apps,
 			Outbound: []*core.OutboundHandlerConfig{{
@@ -147,7 +144,7 @@ func acquireDelayInstance(config *core.Config) (*core.Instance, error) {
 	return delayInstance.instance, nil
 }
 
-// releaseDelayInstance closes the shared instance once neither a measurement nor the exit uses it.
+// releaseDelayInstance closes the shared instance once neither a measurement nor an exit uses it.
 func releaseDelayInstance() {
 	delayInstance.Lock()
 	defer delayInstance.Unlock()
@@ -182,92 +179,202 @@ func addDelayOutbounds(inst *core.Instance, configs []*core.OutboundHandlerConfi
 // The cores that PattNG runs on their own, for scans, key renewals and latency tests, dial out through
 // the exit of the shared instance of their process, as the core of a session dials out through an
 // inbound of the session's configuration: what comes in on the mixed inbound exitInboundTag, on the
-// loopback address, leaves by the freedom outbound exitOutboundTag. The cores of a process share it.
+// loopback address, leaves by the outbound exitOutboundTag, the exit-node of the core: a plain one of
+// its profile, or, in a proxy chain, the hop the core dials out through. PattNG runs one such core at a
+// time in a process, so the inbound and its routing rule stay while the shared instance runs, and only
+// the exit-node changes from one core to the next. A measurement names its outbound, which routing then
+// has no say in.
 const (
 	exitInboundTag  = "secondary-socks"
 	exitOutboundTag = "exit-node"
+	exitRuleTag     = "exit"
 )
 
 var delayExit struct {
 	sync.Mutex
-	inst   *core.Instance
-	port   int
-	users  int
+	// inst is the instance that holds the inbound and the rule of the exit, the inbound on port. A later
+	// instance holds neither until an exit opens in it.
+	inst *core.Instance
+	port int
+	// remove takes the exit-node out again, with the outbounds it dials through; it is set while a core
+	// dials out through the exit.
 	remove func()
 }
 
-// OpenExit returns the port of the exit, which it opens when it is not open; the shared instance runs
-// while the exit is open. Each successful call must be followed by CloseExit.
-func OpenExit() (int64, error) {
+// OpenExit sets the outbound of config tagged exitOutboundTag as the exit-node of the exit, and returns
+// the port of the exit's inbound. Of config, the JSON of an Xray configuration, only the outbounds are
+// read: the exit-node, and every outbound it dials through by dialerProxy, which come along under tags
+// of the exit, see exitOutbounds. The first exit of a shared instance adds the inbound and its rule, on
+// a free port, and they stay while the instance runs. One core at a time dials out through the exit:
+// until CloseExit, a second OpenExit fails. The shared instance runs while the exit is open.
+func OpenExit(config string) (int64, error) {
 	delayExit.Lock()
 	defer delayExit.Unlock()
 
-	if delayExit.users > 0 {
-		delayExit.users++
-		return int64(delayExit.port), nil
+	if delayExit.remove != nil {
+		return -1, errors.New("the exit is open for another core")
 	}
-	port, err := freeLoopbackPort()
+	outbounds, err := exitOutbounds(config)
 	if err != nil {
-		return -1, fmt.Errorf("no port for the exit: %w", err)
+		return -1, fmt.Errorf("outbound load error: %w", err)
 	}
-	config, err := coreserial.LoadJSONConfig(strings.NewReader(fmt.Sprintf(`{
-		"inbounds": [{"tag": %q, "port": %d, "listen": "127.0.0.1", "protocol": "mixed", "settings": {"udp": true}}],
-		"outbounds": [{"tag": %q, "protocol": "freedom"}]
-	}`, exitInboundTag, port, exitOutboundTag)))
+	loaded, err := coreserial.LoadJSONConfig(strings.NewReader(outbounds))
 	if err != nil {
 		return -1, fmt.Errorf("config load error: %w", err)
 	}
-	inst, err := acquireDelayInstance(config)
+
+	inst, err := acquireDelayInstance(loaded)
 	if err != nil {
 		return -1, fmt.Errorf("instance creation failed: %w", err)
 	}
-	remove, err := addDelayOutbounds(inst, config.Outbound)
-	if err == nil {
-		err = core.AddInboundHandler(inst, config.Inbound[0])
+	if delayExit.inst != inst {
+		if err := addExitInbound(inst); err != nil {
+			releaseDelayInstance()
+			return -1, fmt.Errorf("exit creation failed: %w", err)
+		}
 	}
+	remove, err := addDelayOutbounds(inst, loaded.Outbound)
 	if err != nil {
 		remove()
 		releaseDelayInstance()
 		return -1, fmt.Errorf("exit creation failed: %w", err)
 	}
-	delayExit.inst, delayExit.port, delayExit.users, delayExit.remove = inst, port, 1, remove
-	return int64(port), nil
+	delayExit.remove = remove
+	return int64(delayExit.port), nil
 }
 
-// CloseExit lets go of the exit that OpenExit returned. The last one closes it, and the shared instance
-// with it unless a measurement runs.
+// addExitInbound adds the inbound of the exit, on a free port of the loopback address, and the rule that
+// sends what comes in on it out by the exit-node to inst. The caller holds delayExit.
+func addExitInbound(inst *core.Instance) error {
+	port, err := freeLoopbackPort()
+	if err != nil {
+		return err
+	}
+	config, err := coreserial.LoadJSONConfig(strings.NewReader(fmt.Sprintf(`{
+		"inbounds": [{"tag": %q, "port": %d, "listen": "127.0.0.1", "protocol": "mixed", "settings": {"udp": true}}],
+		"routing": {"rules": [{"ruleTag": %q, "inboundTag": [%q], "outboundTag": %q}]}
+	}`, exitInboundTag, port, exitRuleTag, exitInboundTag, exitOutboundTag)))
+	if err != nil {
+		return err
+	}
+	rules := appOf(config, "xray.app.router.Config")
+	if rules == nil {
+		return errors.New("the exit has no routing")
+	}
+	routes := inst.GetFeature(routing.RouterType()).(routing.Router)
+	if err := routes.AddRule(rules, true); err != nil {
+		return err
+	}
+	if err := core.AddInboundHandler(inst, config.Inbound[0]); err != nil {
+		routes.RemoveRule(exitRuleTag)
+		return err
+	}
+	delayExit.inst, delayExit.port = inst, port
+	return nil
+}
+
+// CloseExit takes out the exit-node that OpenExit set, with the outbounds it dials through, and lets go
+// of the shared instance, which closes, with the inbound and the rule of the exit, unless a measurement
+// runs. Without an open exit it does nothing.
 func CloseExit() {
 	delayExit.Lock()
 	defer delayExit.Unlock()
 
-	if delayExit.users == 0 {
+	if delayExit.remove == nil {
 		return
 	}
-	delayExit.users--
-	if delayExit.users > 0 {
-		return
-	}
-	inbounds := delayExit.inst.GetFeature(inbound.ManagerType()).(inbound.Manager)
-	inbounds.RemoveHandler(context.Background(), exitInboundTag)
 	delayExit.remove()
-	delayExit.inst, delayExit.remove = nil, nil
+	delayExit.remove = nil
 	releaseDelayInstance()
 }
 
-// exitRouting returns the routing app of the shared instance: what comes in on the exit leaves by its
-// outbound. A measurement names its outbound, which routing then has no say in.
-func exitRouting() (*serial.TypedMessage, error) {
-	config, err := coreserial.LoadJSONConfig(strings.NewReader(fmt.Sprintf(
-		`{"routing": {"rules": [{"inboundTag": [%q], "outboundTag": %q}]}}`, exitInboundTag, exitOutboundTag)))
-	if err != nil {
-		return nil, err
+// exitOutbounds returns, as the JSON of a configuration with outbounds alone, the outbound of the
+// configuration content tagged exitOutboundTag and every outbound of content that it dials through by
+// dialerProxy, at any depth. Those come along under tags of the exit, exitOutboundTag followed by "/" and
+// their own tag, so that they never meet the outbounds of a measurement, and every dialerProxy among
+// them follows its outbound to the new tag. A dialerProxy that names no outbound of content is left as
+// it is: it names no outbound of the exit either way. When several outbounds have a tag, the first
+// counts, as it does for Xray.
+func exitOutbounds(content string) (string, error) {
+	decoder := json.NewDecoder(&json_reader.Reader{Reader: strings.NewReader(content)})
+	decoder.UseNumber()
+	var config map[string]any
+	if err := decoder.Decode(&config); err != nil {
+		return "", err
 	}
-	for _, app := range config.App {
-		if app.Type == "xray.app.router.Config" {
-			return app, nil
+	all, _ := config[jsonKey(config, "outbounds")].([]any)
+	byTag := map[string]map[string]any{}
+	for _, element := range all {
+		outbound, ok := element.(map[string]any)
+		if !ok {
+			continue
+		}
+		if tag, _ := outbound[jsonKey(outbound, "tag")].(string); tag != "" && byTag[tag] == nil {
+			byTag[tag] = outbound
 		}
 	}
-	return nil, errors.New("the routing of the exit has no router")
+	if byTag[exitOutboundTag] == nil {
+		return "", errors.New("the configuration has no exit-node")
+	}
+
+	tags := map[string]string{exitOutboundTag: exitOutboundTag}
+	order := []string{exitOutboundTag}
+	for i := 0; i < len(order); i++ {
+		for _, tag := range dialerProxiesOf(byTag[order[i]]) {
+			if _, taken := tags[tag]; taken || byTag[tag] == nil {
+				continue
+			}
+			tags[tag] = exitOutboundTag + "/" + tag
+			order = append(order, tag)
+		}
+	}
+	outbounds := make([]any, 0, len(order))
+	for _, tag := range order {
+		outbound := byTag[tag]
+		outbound[jsonKey(outbound, "tag")] = tags[tag]
+		relinkDialerProxies(outbound, tags)
+		outbounds = append(outbounds, outbound)
+	}
+
+	exit, err := json.Marshal(map[string]any{"outbounds": outbounds})
+	if err != nil {
+		return "", err
+	}
+	return string(exit), nil
+}
+
+// dialerProxiesOf returns every dialerProxy in value, in the order they are found.
+func dialerProxiesOf(value any) []string {
+	var found []string
+	var walk func(value any)
+	walk = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, element := range value {
+				if tag, ok := element.(string); ok && strings.EqualFold(key, "dialerProxy") {
+					found = append(found, tag)
+					continue
+				}
+				walk(element)
+			}
+		case []any:
+			for _, element := range value {
+				walk(element)
+			}
+		}
+	}
+	walk(value)
+	return found
+}
+
+// appOf returns the app of config whose type is name, or nil when it has none.
+func appOf(config *core.Config, name string) *serial.TypedMessage {
+	for _, app := range config.App {
+		if app.Type == name {
+			return app
+		}
+	}
+	return nil
 }
 
 // freeLoopbackPort returns a port of the loopback address that nothing listens on.
