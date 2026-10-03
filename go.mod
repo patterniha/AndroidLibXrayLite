@@ -36,8 +36,6 @@ require (
 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
-	github.com/sagernet/sing v0.7.13 // indirect
-	github.com/sagernet/sing-shadowsocks v0.2.9 // indirect
 	github.com/vishvananda/netlink v1.3.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
@@ -62,4 +60,4 @@ require (
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
 
-replace github.com/xtls/xray-core => github.com/patterniha/xray-core v0.0.0-20260927005325-655804bc54f4
+replace github.com/xtls/xray-core => github.com/patterniha/xray-core v0.0.0-20261003172538-1fad76afec8b
