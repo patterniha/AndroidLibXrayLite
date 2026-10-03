@@ -54,7 +54,7 @@ jobs:
          cp -v data/*.dat assets/
          gomobile init
          go mod tidy
-         gomobile bind -v -androidapi 24 -trimpath -ldflags='-s -w -buildid= -checklinkname=0' ./
+         gomobile bind -v -androidapi 29 -trimpath -ldflags='-s -w -buildid= -checklinkname=0' ./
  
     - name: Upload build artifacts
       if: github.event.inputs.release_tag == ''
