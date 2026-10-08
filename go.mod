@@ -60,4 +60,4 @@ require (
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
 
-replace github.com/xtls/xray-core => github.com/patterniha/xray-core v0.0.0-20261008084352-efc97188bc04
+replace github.com/xtls/xray-core => github.com/patterniha/xray-core v0.0.0-20261008141949-aa7886b51c14
