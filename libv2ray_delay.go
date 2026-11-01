@@ -2,6 +2,8 @@ package libv2ray
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -191,22 +193,40 @@ const (
 	exitRuleTag     = "exit"
 )
 
+// ExitUser is the user a core signs in to the inbound of the exit as, with the password of ExitPassword.
+const ExitUser = "aether"
+
 var delayExit struct {
 	sync.Mutex
-	// inst is the instance that holds the inbound and the rule of the exit, the inbound on port. A later
-	// instance holds neither until an exit opens in it.
-	inst *core.Instance
-	port int
+	// inst is the instance that holds the inbound and the rule of the exit, the inbound on port, which
+	// asks for password. A later instance holds neither until an exit opens in it.
+	inst     *core.Instance
+	port     int
+	password string
 	// remove takes the exit-node out again, with the outbounds it dials through; it is set while a core
 	// dials out through the exit.
 	remove func()
+}
+
+// ExitPassword returns the password the inbound of the open exit asks for, of the user ExitUser, or ""
+// when no exit is open. The app's own process is outside the VPN, so an inbound without one would let
+// any app on the device leave past the VPN while a core dials out through the exit.
+func ExitPassword() string {
+	delayExit.Lock()
+	defer delayExit.Unlock()
+
+	if delayExit.remove == nil {
+		return ""
+	}
+	return delayExit.password
 }
 
 // OpenExit sets the outbound of config tagged exitOutboundTag as the exit-node of the exit, and returns
 // the port of the exit's inbound. Of config, the JSON of an Xray configuration, only the outbounds are
 // read: the exit-node, and every outbound it dials through by dialerProxy, which come along under tags
 // of the exit, see exitOutbounds. The first exit of a shared instance adds the inbound and its rule, on
-// a free port, and they stay while the instance runs. One core at a time dials out through the exit:
+// a free port and with the password of ExitPassword, and they stay while the instance runs. One core at
+// a time dials out through the exit:
 // until CloseExit, a second OpenExit fails. The shared instance runs while the exit is open.
 func OpenExit(config string) (int64, error) {
 	delayExit.Lock()
@@ -247,18 +267,24 @@ func OpenExit(config string) (int64, error) {
 // exitPort picks the port of the exit's inbound; a test points it at a port that is taken.
 var exitPort = freeLoopbackPort
 
-// addExitInbound adds the inbound of the exit, on a free port of the loopback address, and the rule that
-// sends what comes in on it out by the exit-node to inst. The caller holds delayExit. On an error it leaves
-// neither behind, so the next exit tries again.
+// addExitInbound adds the inbound of the exit, on a free port of the loopback address, with a new password
+// of ExitUser, and the rule that sends what comes in on it out by the exit-node to inst. The caller holds
+// delayExit. On an error it leaves neither behind, so the next exit tries again.
 func addExitInbound(inst *core.Instance) error {
 	port, err := exitPort()
 	if err != nil {
 		return err
 	}
+	secret := make([]byte, 16)
+	if _, err := rand.Read(secret); err != nil {
+		return err
+	}
+	password := hex.EncodeToString(secret)
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(fmt.Sprintf(`{
-		"inbounds": [{"tag": %q, "port": %d, "listen": "127.0.0.1", "protocol": "mixed", "settings": {"udp": true}}],
+		"inbounds": [{"tag": %q, "port": %d, "listen": "127.0.0.1", "protocol": "mixed",
+			"settings": {"auth": "password", "accounts": [{"user": %q, "pass": %q}], "udp": true}}],
 		"routing": {"rules": [{"ruleTag": %q, "inboundTag": [%q], "outboundTag": %q}]}
-	}`, exitInboundTag, port, exitRuleTag, exitInboundTag, exitOutboundTag)))
+	}`, exitInboundTag, port, ExitUser, password, exitRuleTag, exitInboundTag, exitOutboundTag)))
 	if err != nil {
 		return err
 	}
@@ -278,7 +304,7 @@ func addExitInbound(inst *core.Instance) error {
 		routes.RemoveRule(exitRuleTag)
 		return err
 	}
-	delayExit.inst, delayExit.port = inst, port
+	delayExit.inst, delayExit.port, delayExit.password = inst, port, password
 	return nil
 }
 

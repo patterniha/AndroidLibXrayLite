@@ -318,7 +318,7 @@ func TestOpenExitSwapsTheExitNodeBehindOneInbound(t *testing.T) {
 		return fmt.Sprintf(`{"outbounds": [{"tag": "exit-node", "protocol": "freedom", "settings": {"redirect": %q}}]}`, server.Listener.Addr().String())
 	}
 	through := func(port int64) (string, error) {
-		transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
+		transport := &http.Transport{Proxy: http.ProxyURL(exitProxy(port))}
 		defer transport.CloseIdleConnections()
 		resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/")
 		if err != nil {
@@ -392,6 +392,57 @@ func TestOpenExitSwapsTheExitNodeBehindOneInbound(t *testing.T) {
 // plainExit is the configuration of a plain exit-node, as a profile without finalMask and dialMode has it.
 const plainExit = `{"outbounds": [{"tag": "exit-node", "protocol": "freedom"}]}`
 
+// exitProxy is the inbound of the exit on port as a core dials it, signing in with the password of the open exit.
+func exitProxy(port int64) *url.URL {
+	return &url.URL{Scheme: "socks5", User: url.UserPassword(ExitUser, ExitPassword()), Host: fmt.Sprintf("127.0.0.1:%d", port)}
+}
+
+func TestTheExitLetsOutTheCoreAlone(t *testing.T) {
+	t.Cleanup(CloseExit)
+	// The app's own process is outside the VPN: another app that dials the exit must not get out through it.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("out"))
+	}))
+	defer server.Close()
+	port, err := OpenExit(fmt.Sprintf(`{"outbounds": [{"tag": "exit-node", "protocol": "freedom", "settings": {"redirect": %q}}]}`,
+		server.Listener.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if password := ExitPassword(); len(password) < 32 {
+		t.Fatalf("the exit asks for the password %q", password)
+	}
+	gotOut := func(proxy *url.URL) bool {
+		transport := &http.Transport{Proxy: http.ProxyURL(proxy)}
+		defer transport.CloseIdleConnections()
+		resp, err := (&http.Client{Transport: transport, Timeout: 5 * time.Second}).Get("http://exit.test/")
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return string(body) == "out"
+	}
+
+	if !gotOut(exitProxy(port)) {
+		t.Error("the core did not get out through the exit")
+	}
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+	for _, proxy := range []*url.URL{
+		{Scheme: "socks5", Host: address},
+		{Scheme: "socks5", User: url.UserPassword(ExitUser, "wrong"), Host: address},
+		{Scheme: "http", Host: address},
+	} {
+		if gotOut(proxy) {
+			t.Errorf("%s got out through the exit", proxy.Redacted())
+		}
+	}
+	CloseExit()
+	if ExitPassword() != "" {
+		t.Error("a closed exit still gives its password")
+	}
+}
+
 func TestOpenExitServesOneCoreAtATime(t *testing.T) {
 	t.Cleanup(CloseExit)
 	if _, err := OpenExit(plainExit); err != nil {
@@ -423,7 +474,7 @@ func TestOpenExitDialsByTheSockoptOfItsOutbound(t *testing.T) {
 			server.Listener.Addr().String(), sockopt)
 	}
 	get := func(port int64) error {
-		transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
+		transport := &http.Transport{Proxy: http.ProxyURL(exitProxy(port))}
 		defer transport.CloseIdleConnections()
 		resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/")
 		if err != nil {
@@ -486,7 +537,7 @@ func TestAnExitWhoseInboundCannotListenLeavesNothingBehind(t *testing.T) {
 	if err != nil {
 		t.Fatal("the next exit of the instance did not open: ", err)
 	}
-	transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
+	transport := &http.Transport{Proxy: http.ProxyURL(exitProxy(port))}
 	defer transport.CloseIdleConnections()
 	resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/")
 	if err != nil {
@@ -678,7 +729,7 @@ func TestOpenExitDialsThroughTheHopsOfItsExitNode(t *testing.T) {
 	if handlers().GetHandler("exit-node/hop") == nil || handlers().GetHandler("exit-node/proxy") != nil {
 		t.Error("the exit holds other outbounds than its exit-node and the hop it dials through")
 	}
-	transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: fmt.Sprintf("127.0.0.1:%d", port)})}
+	transport := &http.Transport{Proxy: http.ProxyURL(exitProxy(port))}
 	defer transport.CloseIdleConnections()
 	resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get("http://exit.test/")
 	if err != nil {
