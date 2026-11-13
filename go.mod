@@ -3,7 +3,7 @@ module github.com/2dust/AndroidLibXrayLite
 go 1.27
 
 require (
-	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
+	github.com/apernet/quic-go v0.63.1-0.20261004180939-a10df75c260c
 	github.com/xtls/xray-core v1.260327.1-0.20261109052709-676eaf66f8f0
 	golang.org/x/mobile v0.0.0-20261011034528-197770444867
 )
@@ -20,7 +20,7 @@ require (
 	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.2 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
-	github.com/kr/text v0.2.0 // indirect
+	github.com/kr/pretty v0.3.1 // indirect
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 // indirect
 	github.com/libp2p/go-netroute v0.2.1 // indirect
 	github.com/miekg/dns v1.1.73 // indirect
@@ -60,4 +60,4 @@ require (
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
 
-replace github.com/xtls/xray-core => github.com/patterniha/xray-core v0.0.0-20261110150337-d62d360e1277
+replace github.com/xtls/xray-core => github.com/patterniha/xray-core v0.0.0-20261113204053-cbf3dacc831d
