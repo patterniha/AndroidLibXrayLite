@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/xtls/xray-core/app/router"
+	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
@@ -19,7 +20,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	json_reader "github.com/xtls/xray-core/infra/conf/json"
 	coreserial "github.com/xtls/xray-core/infra/conf/serial"
-	"github.com/xtls/xray-core/proxy/blackhole"
+	"github.com/xtls/xray-core/proxy/freedom"
 )
 
 // Xray runs at most one instance per process (core/xray.go: "At any time, there must be at most one
@@ -125,11 +126,16 @@ func acquireDelayInstance(config *core.Config) (*core.Instance, error) {
 			}
 		}
 		apps = append(apps, serial.ToTypedMessage(&router.Config{}))
+		blockAll := &freedom.Config{Firewall: []*freedom.FirewallConfig{{
+			Action:   freedom.RuleAction_Block,
+			Delay:    &freedom.Range{},
+			LogLevel: log.Severity_Unknown.Enum(),
+		}}}
 		inst, err := core.New(&core.Config{
 			App: apps,
 			Outbound: []*core.OutboundHandlerConfig{{
 				Tag:           delayDefaultTag,
-				ProxySettings: serial.ToTypedMessage(&blackhole.Config{}),
+				ProxySettings: serial.ToTypedMessage(blockAll),
 			}},
 		})
 		if err != nil {
